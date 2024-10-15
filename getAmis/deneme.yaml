@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stack deletion triggers AMI creation from an EC2 instance
+
+Resources:
+  MAYAVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+        - Key: Name
+          Value: MAYA_VPC
+
+  MAYASUBNET:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref MAYAVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: 'true'
+      Tags:
+        - Key: Name
+          Value: MySubnet
+
+  MySecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Allow SSH access
+      VpcId: !Ref MAYAVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: 0.0.0.0/0  # Allow SSH from anywhere (consider restricting this for production environments)
+
+  MyEC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      SubnetId: !Ref MAYASUBNET
+      ImageId: 'ami-0a3598a00eff32f66'
+      InstanceType: 't2.micro'
+      KeyName: 'openvpn-keypair'
+      SecurityGroupIds:
+        - !Ref MySecurityGroup
+      Tags:
+        - Key: Name
+          Value: MyInstance
+
+  CreateAMIRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CreateAMIPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateImage
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  CreateAMILambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CreateAMIRole.Arn
+      Runtime: python3.8
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import logging
+
+          # Initialize EC2 client and logger
+          ec2 = boto3.client('ec2')
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info('Received event: %s', event)
+
+              try:
+                  # Check if the request is for Delete (only run on stack deletion)
+                  if event['RequestType'] == 'Delete':
+                      # Get instance ID from CloudFormation event
+                      instance_id = event['ResourceProperties']['InstanceId']
+                      image_name = "ami-" + instance_id
+
+                      logger.info(f"Creating AMI for instance {instance_id} with name {image_name}")
+
+                      # Create the AMI from the instance
+                      response = ec2.create_image(
+                          InstanceId=instance_id,
+                          Name=image_name,
+                          NoReboot=True
+                      )
+                      
+                      # Get the image ID from the response
+                      image_id = response['ImageId']
+
+                      logger.info(f"AMI created successfully: {image_id}")
+
+                      # Respond SUCCESS to CloudFormation
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'ImageId': image_id
+                      }, image_id)
+                  else:
+                      # If it's not a Delete request, just return SUCCESS with no action
+                      logger.info('Not a Delete request, no AMI created.')
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'No action required, not a Delete request.'
+                      })
+
+              except Exception as e:
+                  logger.error(f"Error creating AMI: {str(e)}")
+                  # Respond FAILURE to CloudFormation
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+  AMITriggerOnDelete:
+    Type: 'AWS::CloudFormation::CustomResource'
+    Properties:
+      ServiceToken: !GetAtt CreateAMILambda.Arn
+      InstanceId: !Ref MyEC2Instance
+    DeletionPolicy: Retain   # Ensures the AMI is created before deletion
+    DependsOn: MyEC2Instance # Ensure that Lambda is run before the instance is deleted

@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'VPC, VPN, and Nginx Server with restricted access from home IP'
+
+Parameters:
+  HomeIPAddress:
+    Description: 'Your home IP address in CIDR notation (e.g., 192.168.1.1/32)'
+    Type: String
+    Default: '46.2.44.180/32'  # Buraya evinizin internet IP adresini ekleyin
+
+Resources:
+  # VPC
+  MyVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+
+  # Internet Gateway
+  MyInternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+
+  # Attach Internet Gateway to VPC
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MyInternetGateway
+
+  # Subnet
+  MySubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: '10.0.1.0/24'
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  # Route Table
+  MyRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref MyVPC
+
+  # Route to Internet Gateway
+  MyRoute:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref MyRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref MyInternetGateway
+
+  # Associate Subnet with Route Table
+  SubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref MySubnet
+      RouteTableId: !Ref MyRouteTable
+
+  # Security Group for Nginx and SSH access
+  NginxSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Allow HTTP and SSH from home IP only'
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        # Allow HTTP access (port 80) from home IP
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref HomeIPAddress
+        # Allow SSH access (port 22) from home IP
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref HomeIPAddress
+        # Allow SSH access (port 22) from EC2 Instance Connect IPs
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '35.180.112.80/29'  # EC2 Instance Connect IP range
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: '0.0.0.0/0'  # Allow all outbound traffic
+
+  # EC2 Instance to Run Nginx
+  NginxInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: 't2.micro'
+      SubnetId: !Ref MySubnet
+      KeyName: 'openvpn-keypair'  # Key pair is specified here
+      ImageId: 'ami-0a3598a00eff32f66'  # Amazon Linux 2 AMI
+      SecurityGroupIds:
+        - !Ref NginxSecurityGroup
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y nginx
+          systemctl start nginx
+          systemctl enable nginx
+      Tags:
+        - Key: Name
+          Value: NginxInstance
+
+  # Virtual Private Gateway for VPN
+  MyVPNGateway:
+    Type: 'AWS::EC2::VPNGateway'
+    Properties:
+      Type: 'ipsec.1'
+
+  # Attach VPN Gateway to VPC
+  AttachVPNGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref MyVPC
+      VpnGatewayId: !Ref MyVPNGateway
+
+  # Customer Gateway for VPN (replace with your static IP address)
+  MyCustomerGateway:
+    Type: 'AWS::EC2::CustomerGateway'
+    Properties:
+      BgpAsn: 65000
+      IpAddress: '46.2.44.180'  # Buraya evinizin statik IP adresini ekleyin
+      Type: 'ipsec.1'
+
+  # VPN Connection
+  MyVPNConnection:
+    Type: 'AWS::EC2::VPNConnection'
+    Properties:
+      Type: 'ipsec.1'
+      CustomerGatewayId: !Ref MyCustomerGateway
+      VpnGatewayId: !Ref MyVPNGateway
+      StaticRoutesOnly: true
+
+  # VPN Route
+  VPNRoute:
+    Type: 'AWS::EC2::VPNConnectionRoute'
+    Properties:
+      DestinationCidrBlock: '0.0.0.0/0'
+      VpnConnectionId: !Ref MyVPNConnection
+
+Outputs:
+  NginxInstancePublicIP:
+    Value: !GetAtt NginxInstance.PublicIp
+    Description: 'Public IP address of the Nginx instance'
+
+  VPCID:
+    Value: !Ref MyVPC
+    Description: 'ID of the VPC'
+
+  VPNGatewayID:
+    Value: !Ref MyVPNGateway
+    Description: 'ID of the VPN Gateway'
+
+  VPNConnectionID:
+    Value: !Ref MyVPNConnection
+    Description: 'ID of the VPN Connection'
+

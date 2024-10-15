@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ''
+
+Mappings:
+  RegionMap:
+    'eu-west-3': 
+      dbsAMI: 'ami-06076f77b0b5'
+      RhAMI: 'ami-079b159672db'
+      RHDLAMI: 'ami-006fedf6f74c'
+      RCAMI: 'ami-0b9d5c0c6ef2'
+      RIAMI: 'ami-0ac331fe6c'
+      RIGNAMI: 'ami-0ff3d8'
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '172.30.0.0/16'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '172.30.10.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  SecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: 'Allow SSH, OpenVPN, HTTP, HTTPS, and internal traffic between instances'
+        VpcId: !Ref VPC
+        SecurityGroupIngress:
+          # SSH from all IPs
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: '0.0.0.0/0'
+          # OpenVPN from all IPs (UDP port 1194)
+          - IpProtocol: udp
+            FromPort: 1194
+            ToPort: 1194
+            CidrIp: '0.0.0.0/0'
+          # HTTP from all IPs (TCP port 80)
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: '0.0.0.0/0'
+          # HTTPS from all IPs (TCP port 443)
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: '0.0.0.0/0'
+          # SSH between instances within the same VPC
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: '172.30.0.0/16'  # VPC's CIDR block
+          # All traffic between instances within the same VPC (for internal communications)
+          - IpProtocol: -1
+            CidrIp: '172.30.0.0/16'  # VPC's CIDR block
+        SecurityGroupEgress:
+          # Allow all outbound traffic
+          - IpProtocol: -1
+            CidrIp: '0.0.0.0/0'
+
+
+  # VPN Gateway
+  MyVPNGateway:
+    Type: 'AWS::EC2::VPNGateway'
+    Properties:
+      Type: 'ipsec.1'
+
+  AttachVPNGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      VpnGatewayId: !Ref MyVPNGateway
+
+  MyCustomerGateway:
+    Type: 'AWS::EC2::CustomerGateway'
+    Properties:
+      BgpAsn: 65000
+      IpAddress: '0.0.0.0'  # Replace with your static home IP address or leave as 0.0.0.0 for testing
+      Type: 'ipsec.1'
+
+  MyVPNConnection:
+    Type: 'AWS::EC2::VPNConnection'
+    Properties:
+      Type: 'ipsec.1'
+      CustomerGatewayId: !Ref MyCustomerGateway
+      VpnGatewayId: !Ref MyVPNGateway
+      StaticRoutesOnly: true
+
+  VPNRoute:
+    Type: 'AWS::EC2::VPNConnectionRoute'
+    Properties:
+      DestinationCidrBlock: '0.0.0.0/0'
+      VpnConnectionId: !Ref MyVPNConnection
+
+  FDbULaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", FcbsDbUpdateAMI]
+        InstanceType: t4g.small
+        IamInstanceProfile:
+          Name: !Ref IAMInstanceProfileForEc2
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        KeyName: 'openvpn-keypair'
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeSize: 8
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: Fcbs-DbUpdate
+
+  FDbAScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref FcbsDbUpdateLaunchTemplate
+        Version: !GetAtt FcbsDbUpdateLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+
+  # Launch Template and Auto Scaling Group for Rating-Helper
+  RHelperLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", RatingHelperAMI]
+        InstanceType: t4g.2xlarge
+        IamInstanceProfile:
+          Name: !Ref IAMInstanceProfileForEc2
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        KeyName: 'openvpn-keypair'
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeSize: 32
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: RHelper
+
+  RHelperAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref RatingHelperLaunchTemplate
+        Version: !GetAtt RatingHelperLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+
+#rating-hdl
+  RHDLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", RatingHDLAMI]
+        InstanceType: t4g.xlarge
+        IamInstanceProfile:
+          Name: !Ref IAMInstanceProfileForEc2
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        KeyName: 'openvpn-keypair'
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeSize: 16
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: RHDL
+
+  RHLAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref RatingHDLLaunchTemplate
+        Version: !GetAtt RatingHDLLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+
+  # Rating-Core
+  RCLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", RatingCoreAMI]
+        InstanceType: t4g.2xlarge
+        IamInstanceProfile:
+          Name: !Ref IAMInstanceProfileForEc2
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        KeyName: 'openvpn-keypair'
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeSize: 32
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: RC
+
+  RCAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref RCLaunchTemplate
+        Version: !GetAtt RCLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+
+  # Rating-Ignite
+  RILaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", RatingIgniteAMI]
+        InstanceType: r6g.2xlarge
+        IamInstanceProfile:
+          Name: !Ref IAMInstanceProfileForEc2
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        KeyName: 'openvpn-keypair'
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeSize: 64
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: RIGN
+
+  RIAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref RatingIgniteLaunchTemplate
+        Version: !GetAtt RILaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+
+  # Rating-Input
+  RInpLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", RatingInputAMI]
+        InstanceType: t4g.2xlarge
+        IamInstanceProfile:
+          Name: !Ref IAMInstanceProfileForEc2
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        KeyName: 'openvpn-keypair'
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeSize: 32
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: RINP
+
+  RInpAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref RILaunchTemplate
+        Version: !GetAtt RInpLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+
+Outputs:
+  VPCID:
+    Value: !Ref VPC
+    Description: 'ID of the VPC'
+
+  VPNGatewayID:
+    Value: !Ref MyVPNGateway
+    Description: 'ID of the VPN Gateway'
+
+  VPNConnectionID:
+    Value: !Ref MyVPNConnection
+    Description: 'ID of the VPN Connection'

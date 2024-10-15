@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'VPC, OpenVPN Server and Test Instance Setup'
+
+Parameters:
+  KeyName:
+    Description: 'Name of an existing EC2 KeyPair to enable SSH access to the instances'
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    ConstraintDescription: 'Must be the name of an existing EC2 KeyPair.'
+
+  InstanceType:
+    Description: 'EC2 instance type for OpenVPN and Test Instance'
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3.small, t3.medium]
+    ConstraintDescription: 'Must be a valid EC2 instance type.'
+
+Resources:
+  # VPC creation
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: 'OpenVPN-VPC'
+
+  # Subnet creation
+  PublicSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '10.0.1.0/24'
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags:
+        - Key: Name
+          Value: 'OpenVPN-Public-Subnet'
+
+  # Internet Gateway
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: 'OpenVPN-InternetGateway'
+
+  # Attach the Internet Gateway to the VPC
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Route Table for public subnet
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: 'OpenVPN-Public-Route-Table'
+
+  # Default route to Internet Gateway
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  # Associate Route Table with Public Subnet
+  PublicSubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group for OpenVPN server
+  OpenVPNSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Enable access to OpenVPN server'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # SSH Access
+        - IpProtocol: udp
+          FromPort: 1194
+          ToPort: 1194
+          CidrIp: 0.0.0.0/0  # OpenVPN Access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0  # Allow all outbound traffic
+
+  # OpenVPN Server EC2 instance
+  OpenVPNInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref OpenVPNSecurityGroup
+      SubnetId: !Ref PublicSubnet
+      ImageId: "ami-0f0ed9c60250723a7"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          amazon-linux-extras install epel -y
+          yum install -y openvpn easy-rsa
+
+          # Setup easy-rsa for certificate management
+          make-cadir /etc/openvpn/easy-rsa
+          cd /etc/openvpn/easy-rsa
+          ./easyrsa init-pki
+          ./easyrsa build-ca nopass
+          ./easyrsa gen-req server nopass
+          ./easyrsa sign-req server server
+          ./easyrsa gen-dh
+          openvpn --genkey --secret /etc/openvpn/ta.key
+          
+          # Move certificates and keys
+          cp pki/ca.crt pki/private/server.key pki/issued/server.crt /etc/openvpn
+          cp /etc/openvpn/easy-rsa/pki/dh.pem /etc/openvpn
+          cp /etc/openvpn/ta.key /etc/openvpn
+
+          # Create OpenVPN server configuration file
+          cat <<EOF > /etc/openvpn/server.conf
+          port 1194
+          proto udp
+          dev tun
+          ca ca.crt
+          cert server.crt
+          key server.key
+          dh dh.pem
+          tls-auth ta.key 0
+          keepalive 10 120
+          persist-key
+          persist-tun
+          user nobody
+          group nogroup
+          auth-user-pass-verify /etc/openvpn/checkpsw.sh via-file
+          username-as-common-name
+          client-cert-not-required
+          status openvpn-status.log
+          log-append /var/log/openvpn.log
+          verb 3
+          EOF
+
+          # Create the checkpsw.sh script for user authentication
+          cat <<'EOF' > /etc/openvpn/checkpsw.sh
+          #!/bin/bash
+          USERNAME=$1
+          PASSWORD=$2
+          CORRECT_PASSWORD=$(grep "^$USERNAME" /etc/openvpn/psw-file | cut -d " " -f 2)
+          if [ "$CORRECT_PASSWORD" == "$PASSWORD" ]; then
+              exit 0
+          else
+              exit 1
+          fi
+          EOF
+
+          chmod 755 /etc/openvpn/checkpsw.sh
+
+          # Add the username and password file
+          echo "vpnuser1 password1" > /etc/openvpn/psw-file
+          echo "vpnuser2 password2" >> /etc/openvpn/psw-file
+          chmod 600 /etc/openvpn/psw-file
+
+          # Enable and start OpenVPN service
+          systemctl enable openvpn@server
+          systemctl start openvpn@server
+
+          # Enable IP forwarding
+          echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+          sysctl -p
+
+  # Test EC2 Instance
+  TestInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: "t4g.small"
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref OpenVPNSecurityGroup
+      SubnetId: !Ref PublicSubnet
+      ImageId: "ami-06076f77b0b5733d5"
+    
+
+Outputs:
+  OpenVPNInstancePublicIP:
+    Description: 'Public IP address of the OpenVPN EC2 instance'
+    Value: !GetAtt OpenVPNInstance.PublicIp
+    Export:
+      Name: OpenVPNInstancePublicIP
+
+  TestInstancePublicIP:
+    Description: 'Public IP address of the Test EC2 instance'
+    Value: !GetAtt TestInstance.PublicIp
+    Export:
+      Name: TestInstancePublicIP

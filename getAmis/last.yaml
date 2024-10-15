@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Create EC2 instances from different AMIs with SSH access, convert each instance to AMI on stack deletion, and restart from corresponding AMI on next stack creation using InstanceName.'
+
+Parameters:
+  KeyName:
+    Description: 'Name of an existing EC2 KeyPair to enable SSH access to the instances'
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    ConstraintDescription: 'Must be the name of an existing EC2 KeyPair.'
+
+Mappings:
+  RegionMap:
+    eu-west-3:
+      AmazonLinuxAMI: "ami-0a3598a00eff32f66"  # Amazon Linux 2 for eu-west-3
+      RedHatAMI: "ami-0574a94188d1b84a1"      # Red Hat Enterprise Linux for eu-west-3
+
+Resources:
+
+  # Create a VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "10.0.0.0/16"
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+
+  # Create a subnet in the VPC
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.1.0/24"
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  # Create an Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  # Attach the Internet Gateway to the VPC
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Create a Route Table
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  # Add a route to the Internet Gateway
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  # Associate the subnet with the route table
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # Create a Security Group for the instances
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: "Enable SSH and HTTP access"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+
+  # DynamoDB table to store AMI IDs for future use using InstanceName as the key
+  AMITable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "EC2InstanceAMIs"
+      AttributeDefinitions:
+        - AttributeName: "InstanceName"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "InstanceName"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+
+# IAM Role for Lambda function with correct permissions for EC2 and DynamoDB
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateImage"
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeTags"
+                  - "dynamodb:PutItem"
+                Resource: "*"
+
+
+# Lambda function to create AMIs and save them in DynamoDB on stack deletion
+  AMICreationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn   # Burada Lambda rolüyle bağladık
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          import cfnresponse
+          ec2 = boto3.client('ec2')
+          dynamodb = boto3.client('dynamodb')
+          AMI_TABLE = 'EC2InstanceAMIs'
+
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      reservations = ec2.describe_instances(
+                          Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]
+                      ).get('Reservations', [])
+
+                      for reservation in reservations:
+                          for instance in reservation['Instances']:
+                              instance_id = instance['InstanceId']
+                              instance_name = next(tag['Value'] for tag in instance['Tags'] if tag['Key'] == 'Name')
+
+                              ami_name = f"Backup-{instance_name}-{int(time.time())}"
+                              response = ec2.create_image(
+                                  InstanceId=instance_id,
+                                  Name=ami_name,
+                                  NoReboot=True
+                              )
+                              ami_id = response['ImageId']
+
+                              dynamodb.put_item(
+                                  TableName=AMI_TABLE,
+                                  Item={
+                                      'InstanceName': {'S': instance_name},
+                                      'AMIId': {'S': ami_id},
+                                      'CreationTime': {'N': str(int(time.time()))}
+                                  }
+                              )
+                      # Send SUCCESS response to CloudFormation
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'AMI creation process completed successfully'})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'No action required'})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Message': str(e)})
+      Runtime: python3.8
+      Timeout: 300
+
+
+  # Custom resource to trigger AMI creation during stack deletion
+  AMICreationCustomResource:
+    Type: "AWS::CloudFormation::CustomResource"
+    Properties:
+      ServiceToken: !GetAtt AMICreationFunction.Arn
+
+  # EC2 Instance 1 (Amazon Linux)
+  MyEC2Instance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AmazonLinuxAMI]
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: "MyAmazonLinuxInstance"
+
+  # EC2 Instance 2 (Red Hat)
+  MyEC2Instance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", RedHatAMI]
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: "MyRedHatInstance"
+
+Outputs:
+  Instance1Id:
+    Description: 'The Instance ID of the created Amazon Linux instance'
+    Value: !Ref MyEC2Instance1
+  Instance2Id:
+    Description: 'The Instance ID of the created Red Hat instance'
+    Value: !Ref MyEC2Instance2
+  AMITableName:
+    Description: 'AMI and instance data stored in DynamoDB'
+    Value: !Ref AMITable
+  LambdaFunctionArn:
+    Description: 'Lambda Function ARN for AMI Creation'
+    Value: !GetAtt AMICreationFunction.Arn

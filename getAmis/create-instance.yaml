@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Create EC2 instances from different AMIs on first run, convert each instance to AMI on stack deletion, and restart from corresponding AMI on next stack creation using InstanceName.'
+
+Parameters:
+  KeyName:
+    Description: 'Name of an existing EC2 KeyPair to enable SSH access to the instances'
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    ConstraintDescription: 'Must be the name of an existing EC2 KeyPair.'
+
+Mappings:
+
+  RegionMap:
+    eu-west-3:
+      AmazonLinuxAMI: "ami-0a3598a00eff32f66"  # Amazon Linux 2 for us-east-1
+      RedHatAMI: "ami-0574a94188d1b84a1"      # Red Hat Enterprise Linux for us-east-1
+
+Resources:
+
+
+  AMITable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "EC2InstanceAMIs"
+      AttributeDefinitions:
+        - AttributeName: "InstanceName"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "InstanceName"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:CreateImage"
+                  - "ec2:DescribeInstances"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:GetItem"
+                Resource: "*"
+
+
+  AMICreationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          ec2 = boto3.client('ec2')
+          dynamodb = boto3.client('dynamodb')
+          AMI_TABLE = 'EC2InstanceAMIs'
+          
+          def lambda_handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  # Get running EC2 instances
+                  reservations = ec2.describe_instances(
+                      Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]
+                  ).get('Reservations', [])
+                  
+                  for reservation in reservations:
+                      for instance in reservation['Instances']:
+                          instance_id = instance['InstanceId']
+                          instance_name = next(tag['Value'] for tag in instance['Tags'] if tag['Key'] == 'Name')
+                          
+                          # Create AMI for the instance and save to DynamoDB
+                          ami_name = f"Backup-{instance_name}-{int(time.time())}"
+                          response = ec2.create_image(
+                              InstanceId=instance_id,
+                              Name=ami_name,
+                              NoReboot=True
+                          )
+                          ami_id = response['ImageId']
+                          
+                          # Save the AMI ID in DynamoDB with the InstanceName
+                          dynamodb.put_item(
+                              TableName=AMI_TABLE,
+                              Item={
+                                  'InstanceName': {'S': instance_name},
+                                  'AMIId': {'S': ami_id},
+                                  'CreationTime': {'N': str(int(time.time()))}
+                              }
+                          )
+              return {
+                  'statusCode': 200,
+                  'body': 'AMI creation process completed successfully.'
+      Runtime: python3.8
+      Timeout: 300
+
+
+  AMICreationCustomResource:
+    Type: "AWS::CloudFormation::CustomResource"
+    Properties:
+      ServiceToken: !GetAtt AMICreationFunction.Arn
+
+  
+  MyEC2Instance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AmazonLinuxAMI]  # Launch from Amazon Linux if no AMI found 
+      Tags:
+        - Key: Name
+          Value: "MyAmazonLinuxInstance"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          echo "Amazon Linux instance started."
+
+
+  MyEC2Instance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", RedHatAMI]  # Launch from Red Hat if no AMI found
+      Tags:
+        - Key: Name
+          Value: "MyRedHatInstance"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          echo "Red Hat instance started."
+
+
+
+
+
+Outputs:
+  Instance1Id:
+    Description: 'The Instance ID of the created Amazon Linux instance'
+    Value: !Ref MyEC2Instance1
+  Instance2Id:
+    Description: 'The Instance ID of the created Red Hat instance'
+    Value: !Ref MyEC2Instance2
+  AMITableName:
+    Description: 'AMI and instance data stored in DynamoDB'
+    Value: !Ref AMITable
+  LambdaFunctionArn:
+    Description: 'Lambda Function ARN for AMI Creation'
+    Value: !GetAtt AMICreationFunction.Arn

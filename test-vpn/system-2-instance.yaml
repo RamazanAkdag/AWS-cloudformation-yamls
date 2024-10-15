@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS infrastructure with VPC, VPN Gateway, and Auto Scaling for Fcbs-dbupdate, Rating-Helper, Rating-HDL, Rating-Core, Rating-Ignite, and Rating-Input in Paris (eu-west-3) using Launch Template'
+
+Mappings:
+  RegionMap:
+    'eu-west-3': 
+      FcbsDbUpdateAMI: 'ami-06076f77b0b5733d5'
+      RatingHelperAMI: 'ami-079b159672db761de'
+      RatingHDLAMI: 'ami-006fedf6f74c5433a'
+      RatingCoreAMI: 'ami-0b9d5c0c6ef2d04ef'
+      RatingIgniteAMI: 'ami-0ac331fe6c16ead59'
+      RatingInputAMI: 'ami-0ff3d8ee9163c2804'
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '172.30.0.0/16'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+
+  # Single Subnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '172.30.10.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: {}
+  
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Route Table and Route Setup
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow ICMP and SSH between VPC instances and EC2 Connect, with VPN access'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Allow SSH between instances within the VPC
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '172.30.0.0/16'
+        # Allow ICMP (ping) between instances in the VPC
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: '172.30.0.0/16'
+        # Allow SSH from EC2 Instance Connect service IPs (Paris region-specific)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '35.180.112.80/29'
+        # Allow SSH from specific static IP over VPN
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 'YOUR_HOME_STATIC_IP/32'
+
+  # Virtual Private Gateway for VPN
+  MyVPNGateway:
+    Type: 'AWS::EC2::VPNGateway'
+    Properties:
+      Type: 'ipsec.1'
+
+  AttachVPNGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      VpnGatewayId: !Ref MyVPNGateway
+
+  MyCustomerGateway:
+    Type: 'AWS::EC2::CustomerGateway'
+    Properties:
+      BgpAsn: 65000
+      IpAddress: 'YOUR_HOME_STATIC_IP'  # Your static home IP address here
+      Type: 'ipsec.1'
+
+  MyVPNConnection:
+    Type: 'AWS::EC2::VPNConnection'
+    Properties:
+      Type: 'ipsec.1'
+      CustomerGatewayId: !Ref MyCustomerGateway
+      VpnGatewayId: !Ref MyVPNGateway
+      StaticRoutesOnly: true
+
+  VPNRoute:
+    Type: 'AWS::EC2::VPNConnectionRoute'
+    Properties:
+      DestinationCidrBlock: '0.0.0.0/0'
+      VpnConnectionId: !Ref MyVPNConnection
+
+  # IAM Role for EC2 instances
+  IAMRoleForEc2:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: Allow
+            Principal: 
+              Service: "ec2.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: DescribeInstancesPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "ec2:DescribeInstances"
+                Resource: "*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  # IAM Instance Profile
+  IAMInstanceProfileForEc2:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref IAMRoleForEc2
+
+  # Launch Template and Auto Scaling Group for Fcbs-dbupdate
+  FcbsDbUpdateLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", FcbsDbUpdateAMI]
+        InstanceType: t4g.small
+        IamInstanceProfile:
+          Name: !Ref IAMInstanceProfileForEc2
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        KeyName: 'openvpn-keypair'
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeSize: 8
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: Fcbs-DbUpdate
+
+  FcbsDbUpdateAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref FcbsDbUpdateLaunchTemplate
+        Version: !GetAtt FcbsDbUpdateLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+
+  # Launch Template and Auto Scaling Group for Rating-Helper
+  RatingHelperLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", RatingHelperAMI]
+        InstanceType: t4g.2xlarge
+        IamInstanceProfile:
+          Name: !Ref IAMInstanceProfileForEc2
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        KeyName: 'openvpn-keypair'
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeSize: 32
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: Rating-Helper
+
+  RatingHelperAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref RatingHelperLaunchTemplate
+        Version: !GetAtt RatingHelperLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+
+Outputs:
+  FcbsDbUpdateInstancePublicIP:
+    Description: 'Public IP of Fcbs-DbUpdate Auto Scaling Group'
+    Value: !GetAtt FcbsDbUpdateAutoScalingGroup.AutoScalingGroupName
+  
+  RatingHelperInstancePublicIP:
+    Description: 'Public IP of Rating-Helper Auto Scaling Group'
+    Value: !GetAtt RatingHelperAutoScalingGroup.AutoScalingGroupName
+
+  VPCID:
+    Value: !Ref VPC
+    Description: 'ID of the VPC'
+
+  VPNGatewayID:
+    Value: !Ref MyVPNGateway
+    Description: 'ID of the VPN Gateway'
+
+  VPNConnectionID:
+    Value: !Ref MyVPNConnection
+    Description: 'ID of the VPN Connection'
